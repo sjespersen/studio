@@ -183,9 +183,17 @@ def has_gpu(st, svc):
         o["state"] in ("running", "restarting") for o in st.get("services", []) if not o.get("always_on"))
 
 
+def find_service(st, service_id):
+    """The switcher's service service_id, or (None) its image service: SwarmUI or ComfyUI."""
+    for s in st.get("services", []):
+        if (s["id"] == service_id) if service_id else s.get("kind") == "image":
+            return s
+    return None
+
+
 def gpu_for(service_id, ready, label):
-    """Makes the switcher give the GPU to service_id and waits until ready() says so. Without a
-    switcher it only waits: starting ComfyUI or the model is up to you."""
+    """Makes the switcher give the GPU to service_id (None: the image service) and waits until
+    ready() says so. Without a switcher it only waits: starting ComfyUI or the model is up to you."""
     if not SWITCHER:
         deadline = time.time() + 60
         while not ready():
@@ -196,9 +204,10 @@ def gpu_for(service_id, ready, label):
             time.sleep(5)
         return
     st = switcher("GET", "/_ai/api/status")
-    svc = next((s for s in st.get("services", []) if s["id"] == service_id), None)
+    svc = find_service(st, service_id)
     if svc is None:
         raise RuntimeError(f"{label} isn't in this stack")
+    service_id = svc["id"]
     if not has_gpu(st, svc):
         switcher("POST", "/_ai/api/switch", {"service": service_id, "force": True})
     deadline = time.time() + 45 * 60  # a first start can download a lot
@@ -206,7 +215,7 @@ def gpu_for(service_id, ready, label):
         if current["stop"]:
             raise RuntimeError("stopped")
         st = switcher("GET", "/_ai/api/status")
-        svc = next((s for s in st.get("services", []) if s["id"] == service_id), {})
+        svc = find_service(st, service_id) or {}
         if st.get("error"):
             raise RuntimeError(st["error"])
         if has_gpu(st, svc) and ready():
@@ -215,8 +224,8 @@ def gpu_for(service_id, ready, label):
     raise RuntimeError(f"{label} didn't start")
 
 
-def need_swarmui():
-    gpu_for("swarmui", comfy.ready, "SwarmUI")
+def need_comfy():
+    gpu_for(None, comfy.ready, "ComfyUI")
 
 
 def llm_models():
@@ -367,7 +376,7 @@ The first frame is <Picture 1> at 0.00 seconds. Use a single [Shot 1] unless the
 # The first line of an H3 prompt that starts from a given first frame (I2VA, in MiniMax's
 # prompt guide). The Studio adds it, so the prompts on the page are just the three fields.
 I2VA = "For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced."
-GUIDE = os.path.join(DATA, "h3-prompt-guide.txt")  # get-guide.sh (homelab-agent: its deploy)
+GUIDE = os.path.join(DATA, "h3-prompt-guide.txt")  # guide.py fetches it
 
 
 def h3_prompt(motion):
@@ -521,7 +530,7 @@ def make_looks(p, up):
     """From the project's descriptions: a reference photo for each character cut out of the
     picture (the identity LoRA restages the crop full body on a plain background, in their
     outfit, which is the photo the stills work best from) and an image of each place."""
-    need_swarmui()
+    need_comfy()
     stop = lambda: current["stop"]
     with lock:
         todo = [("character", c) for c in p["characters"] if c.get("box")] + \
@@ -936,7 +945,7 @@ def worker():
                     s = find(p["shots"], task["shot"])
                 if s is None:
                     raise RuntimeError("shot gone")
-                need_swarmui()
+                need_comfy()
                 up = {}
                 try:
                     field, record = render(p, s, task["kind"], up)

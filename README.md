@@ -99,7 +99,7 @@ services:
 **Without Docker** (Python 3.11 or newer):
 
 ```sh
-./get-guide.sh data
+python3 guide.py data   # MiniMax's H3 prompt guide, optional
 API_KEY=$(openssl rand -hex 24) SWITCHER= LISTEN=127.0.0.1 \
   DATA=data MEDIA=media MODELS=~/ComfyUI/models COMFY_DIR=~/ComfyUI \
   LLM_URL=http://127.0.0.1:11434/v1 COMFY_URL=http://127.0.0.1:8188 python3 app.py
@@ -112,7 +112,7 @@ Then open `http://127.0.0.1:8078`.
 | Setting | Default | What |
 |---|---|---|
 | `API_KEY` | (required) | The page's login; also the Bearer token for gpu-switcher |
-| `SWITCHER` | `http://switcher:8079` | gpu-switcher's address. Empty: no switcher; you start ComfyUI and the chat model yourself |
+| `SWITCHER` | `http://switcher:8079` | gpu-switcher's address. Empty: no switcher; you start ComfyUI and the chat model yourself. With one, the jobs ask it for its image service (`kind: image`) and the chosen chat model |
 | `LLM_URL`, `LLM_KEY` | `http://127.0.0.1:11434/v1` | The chat API without a switcher (with one, the switcher's `/v1` and its Ollama) |
 | `STUDIO_LLM` | `qwen3.8-flash-next` | The chat model for new projects |
 | `COMFY_URL` | `http://swarmui:7801/ComfyBackendDirect` | ComfyUI's API: plain ComfyUI (`http://127.0.0.1:8188`) or SwarmUI's pass-through |
@@ -158,7 +158,7 @@ The instructions to the models (`SHOT_PROMPT`, `REWRITE_PROMPT`, `MOTION_FORMAT`
 `PICTURE_PROMPT` in `app.py`) are defaults. A file `DATA/prompts/<NAME>.txt` replaces one,
 read on each use, so your own versions stay with your projects, out of git.
 
-`get-guide.sh` fetches MiniMax's H3 prompt guide into `DATA` (pinned to a commit and checked by
+`guide.py` fetches MiniMax's H3 prompt guide into `DATA` (pinned to a commit and checked by
 hash; not kept here, since its repository has no license). Without it the model still writes
 the format from a short summary.
 
