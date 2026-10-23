@@ -118,14 +118,27 @@ def find(items, xid):
     return next((x for x in items if x["id"] == xid), None)
 
 
-def shot_state(s):
-    """What the page shows for a shot, and what a batch would do next with it."""
+def end_of(p, s):
+    """The still a shot ends on: the next shot's, when that one continues it (no cut), as
+    "shot id/file"; else None (the shot ends where its motion takes it)."""
+    i = next((i for i, x in enumerate(p["shots"]) if x["id"] == s["id"]), None)
+    nxt = p["shots"][i + 1] if i is not None and i + 1 < len(p["shots"]) else None
+    if nxt and nxt.get("continues") and nxt.get("still"):
+        return f"{nxt['id']}/{nxt['still']['file']}"
+    return None
+
+
+def shot_state(s, end=None):
+    """What the page shows for a shot, and what a batch would do next with it. end: end_of()."""
     still, prev, fin, up = s.get("still"), s.get("preview"), s.get("final"), s.get("upscale")
     prompt_changed = bool(prev and prev.get("prompt") != s["motion_prompt"])
+    end_changed = bool(prev and prev.get("end") != end)
     return {
         "has_still": bool(still),
-        "preview_outdated": bool(prev and (prev.get("still") != (still or {}).get("file") or prompt_changed)),
+        "preview_outdated": bool(prev and (prev.get("still") != (still or {}).get("file") or prompt_changed
+                                           or end_changed)),
         "prompt_changed": prompt_changed,
+        "end_changed": end_changed,
         "final_outdated": bool(fin and fin.get("preview") != (prev or {}).get("file")),
         "upscale_outdated": bool(up and up.get("final") != (fin or {}).get("file")),
     }
@@ -133,7 +146,7 @@ def shot_state(s):
 
 def wanted(p, kind, s):
     """Whether a batch run of `kind` should do this shot."""
-    st = shot_state(s)
+    st = shot_state(s, end_of(p, s))
     if kind == "prompt":
         return not in_h3_format(s["motion_prompt"])
     if kind == "still":
@@ -377,12 +390,31 @@ The first frame is <Picture 1> at 0.00 seconds. Use a single [Shot 1] unless the
 # The first line of an H3 prompt that starts from a given first frame (I2VA, in MiniMax's
 # prompt guide). The Studio adds it, so the prompts on the page are just the three fields.
 I2VA = "For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced."
+# The same with a last frame too (FL2VA): the clip runs from the shot's still to the next one's.
+FL2VA = ("How the reference pictures align with the target video — Picture 1 (from Shot 1) aligns with the "
+         "0.00-second mark of the target video; Picture 2 (from Shot {last}) aligns with the {at:.2f}-second mark "
+         "of the target video.")
 GUIDE = os.path.join(DATA, "h3-prompt-guide.txt")  # guide.py fetches it
 
 
-def h3_prompt(motion):
+def h3_prompt(motion, end_at=None):
+    """The prompt H3 gets: the fields with the first line. end_at: the second the last frame
+    sits at (FL2VA), or None (I2VA). A prompt written with its own first line stays as it is,
+    except an I2VA one for a clip that now has a last frame."""
     m = motion.strip()
-    return m if m.startswith(("For the target video", "How the reference")) else f"{I2VA}\n\n{m}"
+    if end_at is None:
+        return m if m.startswith(("For the target video", "How the reference")) else f"{I2VA}\n\n{m}"
+    if m.startswith("How the reference"):
+        return m
+    if m.startswith("For the target video"):
+        m = m.partition("\n")[2].strip()
+    last = max([int(x) for x in re.findall(r"\[Shot (\d+)\]", m)] or [1])
+    return FL2VA.format(last=last, at=end_at) + "\n\n" + m
+
+
+def end_at(seconds):
+    """Where H3 puts a last frame: the clip's last frame, on its 17k+5 grid."""
+    return (wf.frames(seconds) - 1) / wf.FPS
 
 
 def with_guide(system):
@@ -527,6 +559,42 @@ def take_picture(p, reading):
 PORTRAIT = (768, 1024)  # character photos: full body, upright
 
 
+def krea_models():
+    """The distilled Krea 2 models in the models folder's diffusion_models (Krea 2 Turbo and
+    finetunes of it, rendered with its settings), from their tensor names: [{"file", "title"}]."""
+    root = model_dir("diffusion_models")
+    out = []
+    for folder, _, files in os.walk(root):
+        for f in sorted(files):
+            if not f.endswith(".safetensors"):
+                continue
+            path = os.path.join(folder, f)
+            try:
+                mtime = os.path.getmtime(path)
+                if unet_info.get(path, (None,))[0] != mtime:
+                    with open(path, "rb") as fh:
+                        n = struct.unpack("<Q", fh.read(8))[0]
+                        head = json.loads(fh.read(min(n, 64 * 1024 * 1024)))
+                    keys = [k.split("diffusion_model.")[-1] for k in head]
+                    unet_info[path] = (mtime, any(k.startswith("txtfusion.") for k in keys)
+                                       and any(k.startswith("blocks.0.attn.gate") for k in keys))
+            except (OSError, ValueError, struct.error):
+                continue
+            if unet_info[path][1]:
+                rel = os.path.relpath(path, root)
+                out.append({"file": rel, "title": os.path.splitext(f)[0]})
+    return out
+
+
+unet_info = {}  # path -> (mtime, is a Krea 2 model)
+
+
+def image_model(p):
+    """The project's Krea 2 model for stills, characters and places, if it's still there."""
+    f = p.get("image_model")
+    return f if f and any(x["file"] == f for x in krea_models()) else wf.KREA_UNET
+
+
 def make_looks(p, up):
     """From the project's descriptions: a reference photo for each character cut out of the
     picture (the identity LoRA restages the crop full body on a plain background, in their
@@ -548,7 +616,8 @@ def make_looks(p, up):
                       "relaxed, the whole body from head to shoes in frame" + (f", wearing {outfit}" if outfit else "")
                       + ". Plain light grey studio background, soft even light, nothing else in the picture.")
             file = f"refs/{x['id']}-{int(time.time())}.png"
-            comfy.run(wf.still([prompt], [(name, box)], PORTRAIT, seed, f"studio/{p['id']}/looks"),
+            comfy.run(wf.still([prompt], [(name, box)], PORTRAIT, seed, f"studio/{p['id']}/looks",
+                               unet_name=image_model(p)),
                       os.path.join(project_dir(p["id"]), file), stop)
             with lock:
                 x["ref"] = file
@@ -559,7 +628,7 @@ def make_looks(p, up):
             prompt = f"Wide establishing photo of an empty place, no people: {x['look']}"
             loras, triggers = project_loras(p)
             comfy.run(wf.still(with_triggers([prompt], triggers), [], sizes["final"], seed, f"studio/{p['id']}/looks",
-                               loras=loras),
+                               loras=loras, unet_name=image_model(p)),
                       os.path.join(project_dir(p["id"]), file), stop)
             with lock:
                 x["image"] = file
@@ -790,8 +859,13 @@ def rewrite_prompt(p, s):
         draft = s["motion_prompt"]
         place = find(p["places"], s.get("place")) if s.get("place") else None
         looks = "".join(f"\n{c['name']} {pos or ''} wears: {look}" for c, pos, look in cast_of(p, s) if look)
+        end = end_of(p, s)
+        nxt = find(p["shots"], end.split("/")[0]) if end else None
         user = (f"First frame (the still's prompt):\n{s['still_prompt'] or '(none)'}"
                 + (f"\nThe place: {place['look']}" if place else "") + looks
+                + (f"\n\nThere is no cut after this shot: the clip must end exactly on the next shot's first frame, "
+                   f"so describe a continuous path from the first frame to it (FL2VA). The last frame:\n"
+                   f"{nxt['still_prompt'] or '(no prompt)'}" if nxt else "")
                 + f"\n\nCharacters in it: {names}\n"
                 f"Length: {s['seconds']} seconds\n\nDraft motion prompt:\n{draft or '(none: invent fitting motion and sound)'}")
     text = llm(with_guide(own("REWRITE_PROMPT")), user, p.get("llm") or LLM_MODEL)
@@ -829,13 +903,25 @@ def forget_uploads(cache):
     comfy.forget(names=list(cache.values()))
 
 
-def render(p, s, kind, up):
+def render(p, s, kind, up, seed=None):
+    """One shot's still, preview, final or upscale. seed: the one to use (Same seed), else new."""
     pid, sid = p["id"], s["id"]
     out = media_dir(pid, sid)
     os.makedirs(out, exist_ok=True)
     sizes = wf.SIZES.get(p["aspect"], wf.SIZES["16:9"])
     stop = lambda: current["stop"]
-    seed = random.randrange(1, 2**31)
+    seed = seed or random.randrange(1, 2**31)
+
+    def last_frame(end):
+        """Uploads the still a clip ends on ("shot id/file", see end_of)."""
+        if not end:
+            return None
+        nsid, nfile = end.split("/", 1)
+        path = os.path.join(media_dir(pid, nsid), nfile)
+        if not os.path.exists(path):
+            raise RuntimeError("the still this shot ends on is gone: render a new preview")
+        return upload_once(path, f"studio_{pid}_{nsid}_{nfile}", up)
+
     if kind == "still":
         with lock:
             photos = [(c["ref"], c.get("box")) for c, _, _ in cast_of(p, s)]
@@ -844,27 +930,34 @@ def render(p, s, kind, up):
         refs = [(upload_once(os.path.join(project_dir(pid), ref), f"studio_{pid}_{ref.split('/')[-1]}", up), box)
                 for ref, box in photos]
         name = f"still-{seed}.png"
+        model = image_model(p)
         took = comfy.run(wf.still(with_triggers(prompts, triggers), refs, sizes["final"], seed, f"studio/{pid}/{sid}",
-                                  loras=loras), os.path.join(out, name), stop)
+                                  loras=loras, unet_name=model), os.path.join(out, name), stop)
         return "still", {"file": name, "seed": seed, "took": took, "at": int(time.time()),
-                         **({"loras": [f"{os.path.splitext(f)[0]} {w:g}" for f, w in loras]} if loras else {})}
+                         **({"loras": [f"{os.path.splitext(f)[0]} {w:g}" for f, w in loras]} if loras else {}),
+                         **({"model": os.path.splitext(os.path.basename(model))[0]} if model != wf.KREA_UNET else {})}
     if kind == "preview":
         still = s["still"]["file"]
         frame = upload_once(os.path.join(out, still), f"studio_{pid}_{sid}_{still}", up)
         name = f"preview-{seed}.mp4"
         loras, _ = project_loras(p, "video_loras", "h3")
-        took = comfy.run(wf.preview(h3_prompt(s["motion_prompt"]), frame, sizes["preview"], s["seconds"], seed, f"studio/{pid}/{sid}",
-                                    loras=loras), os.path.join(out, name), stop)
+        with lock:
+            end = end_of(p, s)
+        prompt = h3_prompt(s["motion_prompt"], end_at(s["seconds"]) if end else None)
+        took = comfy.run(wf.preview(prompt, frame, sizes["preview"], s["seconds"], seed, f"studio/{pid}/{sid}",
+                                    loras=loras, last_frame=last_frame(end)), os.path.join(out, name), stop)
         return "preview", {"file": name, "seed": seed, "still": still, "prompt": s["motion_prompt"],
-                           "seconds": s["seconds"], "took": took, "at": int(time.time()),
+                           "seconds": s["seconds"], "took": took, "at": int(time.time()), **({"end": end} if end else {}),
                            **({"video_loras": [{"file": f, "strength": w} for f, w in loras]} if loras else {})}
     if kind == "final":
         prev = s["preview"]  # the approved one: its seed, frame, prompt, length and LoRAs again
         frame = upload_once(os.path.join(out, prev["still"]), f"studio_{pid}_{sid}_{prev['still']}", up)
         name = f"final-{prev['seed']}.mp4"
         loras, _ = project_loras(prev, "video_loras", "h3")
-        took = comfy.run(wf.final(h3_prompt(prev["prompt"]), frame, sizes["preview"], sizes["final"], prev["seconds"],
-                                  prev["seed"], f"studio/{pid}/{sid}", refine=p.get("refine", "standard"), loras=loras),
+        end = prev.get("end")
+        took = comfy.run(wf.final(h3_prompt(prev["prompt"], end_at(prev["seconds"]) if end else None), frame,
+                                  sizes["preview"], sizes["final"], prev["seconds"], prev["seed"], f"studio/{pid}/{sid}",
+                                  refine=p.get("refine", "standard"), loras=loras, last_frame=last_frame(end)),
                          os.path.join(out, name), stop)
         return "final", {"file": name, "preview": prev["file"], "took": took, "at": int(time.time())}
     if kind == "upscale":
@@ -949,7 +1042,7 @@ def worker():
                 need_comfy()
                 up = {}
                 try:
-                    field, record = render(p, s, task["kind"], up)
+                    field, record = render(p, s, task["kind"], up, task.get("seed"))
                 finally:
                     forget_uploads(up)
                 with lock:
@@ -978,7 +1071,9 @@ def worker():
             current.update(task=None, since=0)
 
 
-def enqueue(p, kind, shot_ids, replace=False):
+def enqueue(p, kind, shot_ids, replace=False, same_seed=False):
+    """Queues a job per shot (or one for the project). same_seed: a still or preview again with
+    the seed of the one there now, to see what a changed prompt or LoRA strength does."""
     with lock:
         if kind in ("shots", "looks"):
             if not any(t["project"] == p["id"] and t["kind"] == kind for t in queue):
@@ -999,7 +1094,10 @@ def enqueue(p, kind, shot_ids, replace=False):
             if any(t["shot"] == s["id"] and t["kind"] == kind for t in queue if "shot" in t) or \
                     (busy.get("shot") == s["id"] and busy.get("kind") == kind):
                 continue
-            queue.append({"id": new_id("t"), "project": p["id"], "kind": kind, "shot": s["id"]})
+            task = {"id": new_id("t"), "project": p["id"], "kind": kind, "shot": s["id"]}
+            if same_seed and kind in ("still", "preview") and (s.get(kind) or {}).get("seed"):
+                task["seed"] = s[kind]["seed"]
+            queue.append(task)
             added += 1
         return added
 
@@ -1053,7 +1151,7 @@ class ZipOut:
 def public(p):
     """A project for the page: the stored fields plus each shot's state."""
     out = dict(p)
-    out["shots"] = [{**s, "state": shot_state(s)} for s in p["shots"]]
+    out["shots"] = [{**s, "state": shot_state(s, end_of(p, s))} for s in p["shots"]]
     return out
 
 
@@ -1310,6 +1408,7 @@ class Handler(BaseHTTPRequestHandler):
                     "llm": LLM_MODEL, "sizes": wf.SIZES, "switcher": bool(SWITCHER), "now": time.time()})
         if parts == ["api", "loras"]:
             return self.json({"loras": installed_loras("krea"), "video_loras": installed_loras("h3"),
+                              "image_models": krea_models(), "image_model_default": wf.KREA_UNET,
                               "targets": {"loras": LORA_TARGET["krea"], "video_loras": LORA_TARGET["h3"]}})
         if parts == ["api", "models"]:
             try:
@@ -1565,6 +1664,9 @@ class Handler(BaseHTTPRequestHandler):
                             p[key].append({"file": x["file"], "strength": round(strength, 2)})
                 if req.get("upscale") in wf.UPSCALE_MODES:
                     p["upscale"] = req["upscale"]
+                if "image_model" in req:
+                    f = req["image_model"]
+                    p["image_model"] = f if any(x["file"] == f for x in krea_models()) and f != wf.KREA_UNET else None
                 if isinstance(req.get("vision_llm"), str):
                     p["vision_llm"] = req["vision_llm"].strip()[:200] or None
                 if isinstance(req.get("target_shots"), int):
@@ -1638,6 +1740,8 @@ class Handler(BaseHTTPRequestHandler):
                                 cur["outfit"] = o["id"] if o and o["character"] == cid else None
                 if req.get("review") in ("pending", "approved", "rejected"):
                     s["review"] = req["review"]
+                if isinstance(req.get("continues"), bool):
+                    s["continues"] = req["continues"]
                 if isinstance(req.get("move"), int):
                     p["shots"].remove(s)
                     p["shots"].insert(max(0, min(len(p["shots"]), req["move"])), s)
@@ -1652,7 +1756,8 @@ class Handler(BaseHTTPRequestHandler):
                 if missing_models(kind):
                     return self.json({"error": "models missing: " + ", ".join(missing_models(kind))}, 409)
                 shots = req.get("shots", "all")
-                added = enqueue(p, kind, shots if isinstance(shots, list) else "all", bool(req.get("replace")))
+                added = enqueue(p, kind, shots if isinstance(shots, list) else "all", bool(req.get("replace")),
+                                bool(req.get("same_seed")))
                 return self.json({"queued": added})
         self.json({"error": "not found"}, 404)
 

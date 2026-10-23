@@ -81,15 +81,15 @@ def _save_video(g, images, audio, prefix, crf=16):
 OWN_LORAS = {KREA_IDENTITY, H3_TURBO}
 
 
-def still(prompts, refs, size, seed, prefix, steps=8, ref_boost=2.0, loras=()):
-    """Krea 2 Turbo. With references ((uploaded image name, box or None), one per character; a
+def still(prompts, refs, size, seed, prefix, steps=8, ref_boost=2.0, loras=(), unet_name=KREA_UNET):
+    """Krea 2 Turbo, or another distilled Krea 2 model (unet_name, same settings). With references ((uploaded image name, box or None), one per character; a
     box [x1, y1, x2, y2] crops the person out of a bigger picture): the Krea 2
     Identity Edit V2 LoRA, one pass per person, each with its own prompt; the first restages
     person 1, each further pass keeps the picture so far (aligned) and brings in the next
     person (beside). `loras`: [(file, strength)] the project adds (styles), under the identity one."""
     g = Graph()
     w, h = size
-    unet = g.add("UNETLoader", unet_name=KREA_UNET, weight_dtype="default")
+    unet = g.add("UNETLoader", unet_name=unet_name, weight_dtype="default")
     for name, strength in loras:
         unet = g.add("LoraLoaderModelOnly", model=[unet, 0], lora_name=name, strength_model=float(strength))
     clip = g.add("CLIPLoader", clip_name=KREA_CLIP, type="krea2", device="default")
@@ -138,10 +138,12 @@ def still(prompts, refs, size, seed, prefix, steps=8, ref_boost=2.0, loras=()):
     return g.nodes
 
 
-def _h3_base(g, prompt, first_frame, size, length, seed, steps, loras=()):
+def _h3_base(g, prompt, first_frame, size, length, seed, steps, loras=(), last_frame=None):
     """MiniMax H3 from a first frame, as in ComfyUI's "Image to Video (MiniMax H3)" with the
     4-step turbo LoRA. `loras`: [(file, strength)] the project adds, after the turbo one.
-    Returns (model, clip, vae, audio_vae, image, sampled)."""
+    `last_frame`: an uploaded image the clip ends on (H3's first-and-last-frame mode, FL2VA).
+    Returns (model, clip, vae, audio_vae, keyframes, sampled, noise, sampler); keyframes is the
+    MiniMaxH3ImageToVideo inputs for the first and last frame."""
     unet = g.add("UNETLoader", unet_name=H3_UNET, weight_dtype="default")
     lora = g.add("LoraLoaderModelOnly", model=[unet, 0], lora_name=H3_TURBO, strength_model=1.0)
     for name, strength in loras:
@@ -150,37 +152,41 @@ def _h3_base(g, prompt, first_frame, size, length, seed, steps, loras=()):
     clip = g.add("CLIPLoader", clip_name=H3_CLIP, type="minimax", device="default")
     vae = g.add("VAELoader", vae_name=H3_VAE)
     audio_vae = g.add("VAELoader", vae_name=H3_AUDIO_VAE)
-    image = g.add("LoadImage", image=first_frame)
+    keyframes = {"first_frame": [g.add("LoadImage", image=first_frame), 0]}
+    if last_frame:
+        keyframes["last_frame"] = [g.add("LoadImage", image=last_frame), 0]
     w, h = size
     cond = g.add("MiniMaxH3ImageToVideo", clip=[clip, 0], vae=[vae, 0], prompt=prompt, width=w,
-                 height=h, length=length, first_frame=[image, 0])
+                 height=h, length=length, **keyframes)
     noise = g.add("RandomNoise", noise_seed=seed)
     sampler = g.add("KSamplerSelect", sampler_name="euler")
     sigmas = g.add("BasicScheduler", model=[model, 0], scheduler="simple", steps=steps, denoise=1.0)
     guider = g.add("BasicGuider", model=[model, 0], conditioning=[cond, 0])
     sampled = g.add("SamplerCustomAdvanced", noise=[noise, 0], guider=[guider, 0],
                     sampler=[sampler, 0], sigmas=[sigmas, 0], latent_image=[cond, 1])
-    return model, clip, vae, audio_vae, image, sampled, noise, sampler
+    return model, clip, vae, audio_vae, keyframes, sampled, noise, sampler
 
 
-def preview(prompt, first_frame, size, seconds, seed, prefix, steps=4, loras=()):
+def preview(prompt, first_frame, size, seconds, seed, prefix, steps=4, loras=(), last_frame=None):
     """The low-resolution pass, to judge the motion."""
     g = Graph()
-    _, _, vae, audio_vae, _, sampled, _, _ = _h3_base(g, prompt, first_frame, size, frames(seconds), seed, steps, loras)
+    _, _, vae, audio_vae, _, sampled, _, _ = _h3_base(g, prompt, first_frame, size, frames(seconds), seed, steps, loras,
+                                                      last_frame)
     images = g.add("VAEDecode", samples=[sampled, 0], vae=[vae, 0])
     audio = g.add("VAEDecodeAudio", samples=[sampled, 0], vae=[audio_vae, 0])
     _save_video(g, [images, 0], [audio, 0], prefix, crf=20)
     return g.nodes
 
 
-def final(prompt, first_frame, preview_size, size, seconds, seed, prefix, steps=4, refine="standard", loras=()):
+def final(prompt, first_frame, preview_size, size, seconds, seed, prefix, steps=4, refine="standard", loras=(),
+          last_frame=None):
     """The approved preview again (same seed and LoRAs, so the same motion), its video latent
     upscaled by the learned H3 upscaler, then a short refine pass at full size: the node pack's
     example workflow ("minimax_h3_i2v Latent Upscaler")."""
     g = Graph()
     length = frames(seconds)
-    model, clip, vae, audio_vae, image, sampled, noise, sampler = _h3_base(
-        g, prompt, first_frame, preview_size, length, seed, steps, loras)
+    model, clip, vae, audio_vae, keyframes, sampled, noise, sampler = _h3_base(
+        g, prompt, first_frame, preview_size, length, seed, steps, loras, last_frame)
     w, h = size
     av = g.add("LTXVSeparateAVLatent", av_latent=[sampled, 0])
     up = g.add("MinimaxH3LatentUpscaler3D", latent=[av, 0], model_name=H3_UPSCALER, align=32,
@@ -188,7 +194,7 @@ def final(prompt, first_frame, preview_size, size, seconds, seed, prefix, steps=
                **{"mode": "target dimensions", "mode.width": w, "mode.height": h})
     joined = g.add("LTXVConcatAVLatent", video_latent=[up, 0], audio_latent=[av, 1])
     cond = g.add("MiniMaxH3ImageToVideo", clip=[clip, 0], vae=[vae, 0], prompt=prompt, width=w,
-                 height=h, length=length, first_frame=[image, 0])
+                 height=h, length=length, **keyframes)
     guider = g.add("BasicGuider", model=[model, 0], conditioning=[cond, 0])
     sigmas = g.add("ManualSigmas", sigmas=REFINE_SIGMAS.get(refine, REFINE_SIGMAS["standard"]))
     refined = g.add("SamplerCustomAdvanced", noise=[noise, 0], guider=[guider, 0],

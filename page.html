@@ -133,6 +133,8 @@ label { font-size:11px; color:var(--muted); display:block; margin:8px 0 3px; }
 .loras .row { flex-wrap:nowrap; }
 .loras select { min-width:0; flex:1; padding:4px 6px; font-size:12px; }
 .loras input { width:62px; padding:4px 6px; font-size:12px; text-align:right; }
+.shot-head .cont { margin:0; display:flex; gap:4px; align-items:center; font-size:12px; color:var(--muted); white-space:nowrap; }
+.shot-head .cont input { width:auto; }
 .loras .sug { white-space:nowrap; padding:3px 7px; color:var(--warn); }
 .loras .hint.warn { color:var(--warn); }
 /* Places and outfits */
@@ -295,6 +297,8 @@ function renderProject(first) {
           ${[['clean', 'Clean: no invented detail (finish in Resolve)'], ['soft', 'Soft: SeedVR2 mixed with a plain upscale'],
              ['seedvr2', 'SeedVR2: most detail, invents skin texture']].map(([v, l]) =>
             `<option value="${v}" ${(P.upscale || 'clean') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div></div>
+        <label>Image model for the stills, character photos and places (distilled Krea 2 models in diffusion_models)</label>
+        <select id="p-image-model"></select>
         <label>LoRAs for the stills and place images (Krea 2, from the models folder's Lora or loras)</label>
         <div id="loras" class="loras"></div>
         <label>Video LoRAs for the previews and finals (MiniMax H3, from the models folder's Lora or loras)</label>
@@ -526,7 +530,7 @@ function isQueued(s, kind) { return (STATE.queue || []).some(t => t.project === 
 let LORAS = null;
 async function loadLoras() {
   try { LORAS = await api('GET', '/api/loras'); } catch (e) { return; }
-  renderLoras('loras'); renderLoras('video_loras');
+  renderLoras('loras'); renderLoras('video_loras'); renderImageModel();
 }
 const LORA_HINTS = {
   loras: ['Strong styles can fight the identity LoRA: 0.5-0.8 is a good start.', 'None: Krea 2 as it is.', 'No Krea 2 LoRAs in the models folder.'],
@@ -567,6 +571,15 @@ function renderLoras(key) {
   };
 }
 
+function renderImageModel() {
+  const sel = $('p-image-model'); if (!sel || !LORAS) return;
+  const def = LORAS.image_model_default, cur = P.image_model || def;
+  const list = (LORAS.image_models || []).some(x => x.file === def) ? LORAS.image_models : [{file: def, title: def}, ...(LORAS.image_models || [])];
+  sel.innerHTML = list.map(x => `<option value="${esc(x.file)}" ${x.file === cur ? 'selected' : ''}>${esc(x.title)}${x.file === def ? ' (default)' : ''}</option>`).join('');
+  sel.title = 'Rendered with Krea 2 Turbo\'s settings (8 steps), so only distilled models fit. Applies to new stills, character photos and places';
+  sel.onchange = e => api('POST', `/api/projects/${P.id}/update`, {image_model: e.target.value}).then(d => { P = d; renderImageModel(); });
+}
+
 // The models the shot list can use (the switcher's and Ollama's, as in Open WebUI).
 async function loadModels() {
   let d; try { d = await api('GET', '/api/models'); } catch (e) { return; }
@@ -582,7 +595,7 @@ async function loadModels() {
       + seeing.map(m => `<option value="${esc(m.id)}" title="${esc(m.id)}" ${m.id === P.vision_llm ? 'selected' : ''}>Reads it: ${esc(m.label)}</option>`).join('')
     : '<option value="">No model here reads pictures: download one with vision (Ollama, Open WebUI)</option>';
 }
-function run(kind, s) { return api('POST', `/api/projects/${P.id}/run`, {kind, shots: [s.id]}).then(poll); }
+function run(kind, s, same_seed) { return api('POST', `/api/projects/${P.id}/run`, {kind, shots: [s.id], same_seed: !!same_seed}).then(poll); }
 function patch(s, body) { return api('POST', `/api/projects/${P.id}/shots/${s.id}`, body).then(d => { P = d; renderProject(false); }); }
 
 // Shot cards: built once per shot, then only their changing parts are updated, so a playing
@@ -603,6 +616,7 @@ function updateShot(el, s, i) {
     el._built = true;
     el.innerHTML = `<div class="shot-head"><span class="num"></span><input class="title"><div class="who"></div><select class="place-sel" title="The place: its look is added to the still"></select>
       <span class="hint">seconds</span><input class="secs" type="number" min="4" max="15">
+      <label class="cont" title="On: no cut. The previous shot's clip ends exactly on this shot's still (H3's first-and-last-frame mode), so the two join seamlessly. Off: a cut, for a new camera angle or scene."><input type="checkbox"> continues</label>
       <span class="pill rv"></span>
       <button class="small up" title="Move up">${icon('up')}</button><button class="small down" title="Move down">${icon('down')}</button>
       <button class="small del" data-label="Delete">Delete</button></div>
@@ -613,6 +627,7 @@ function updateShot(el, s, i) {
       <div class="err" hidden></div>`;
     el.querySelector('.title').onchange = e => patch(s, {title: e.target.value});
     el.querySelector('.secs').onchange = e => patch(s, {seconds: parseInt(e.target.value) || 6});
+    el.querySelector('.cont input').onchange = e => patch(s, {continues: e.target.checked});
     el.querySelector('.sp').onchange = e => patch(s, {still_prompt: e.target.value});
     el.querySelector('.mp').onchange = e => patch(s, {motion_prompt: e.target.value});
     el.querySelector('.rw').onclick = () => run('prompt', P.shots.find(x => x.id === s.id) || s);
@@ -624,6 +639,7 @@ function updateShot(el, s, i) {
   const set = (sel, v) => { const x = el.querySelector(sel); if (x !== document.activeElement && x.value !== String(v)) x.value = v; };
   el.querySelector('.num').textContent = i + 1;
   set('.title', s.title); set('.secs', s.seconds); set('.sp', s.still_prompt); set('.mp', s.motion_prompt);
+  const cont = el.querySelector('.cont'); cont.hidden = i === 0; cont.querySelector('input').checked = !!s.continues;
   const rw = el.querySelector('.rw'), rwBusy = isRunning(s, 'prompt') || isQueued(s, 'prompt');
   rw.disabled = !!rwBusy; rw.textContent = isRunning(s, 'prompt') ? 'Rewriting…' : rwBusy ? 'Queued' : 'Rewrite for H3';
   const who = P.characters.map(c => `<button class="${s.characters.includes(c.id) ? 'on' : ''}" data-c="${c.id}">${esc(c.name)}</button>`).join('');
@@ -662,11 +678,15 @@ function updateShot(el, s, i) {
 
   const st = s.state;
   fill(el.querySelector('.s-still'), s, 'still', s.still && `<img src="${media(s, s.still.file)}" alt="">`,
-    s.still ? (s.still.picture ? 'the picture' : `seed ${s.still.seed} · ${s.still.took}s`) + (s.still.loras ? ' · LoRA' : '') : '', [['redo', s.still ? 'New still' : 'Make', () => run('still', s)]]);
+    s.still ? (s.still.picture ? 'the picture' : `seed ${s.still.seed} · ${s.still.took}s`) + (s.still.model ? ' · ' + s.still.model : '') + (s.still.loras ? ' · LoRA' : '') : '',
+    [['redo', s.still ? 'New still' : 'Make', () => run('still', s)],
+     ...(s.still && s.still.seed ? [['redo', 'Same seed', () => run('still', s, true)]] : [])]);
   fill(el.querySelector('.s-preview'), s, 'preview', s.preview && `<video src="${media(s, s.preview.file)}" controls loop playsinline preload="metadata"></video>`,
-    s.preview ? (st.preview_outdated ? (st.prompt_changed ? 'prompt changed' : 'new still since') : `${s.preview.took}s` + (s.preview.video_loras ? ' · LoRA' : '')) : '',
+    s.preview ? (st.preview_outdated ? (st.prompt_changed ? 'prompt changed' : st.end_changed ? 'next still changed' : 'new still since')
+      : `${s.preview.took}s` + (s.preview.end ? ' · into next' : '') + (s.preview.video_loras ? ' · LoRA' : '')) : '',
     [...(s.preview ? [['check', s.review === 'approved' ? 'Approved' : 'Approve', () => patch(s, {review: s.review === 'approved' ? 'pending' : 'approved'}), s.review === 'approved']] : []),
-     ['redo', s.preview ? 'Retry' : 'Render', () => run('preview', s), false, !s.still]]);
+     ['redo', s.preview ? 'Retry' : 'Render', () => run('preview', s), false, !s.still],
+     ...(s.preview ? [['redo', 'Same seed', () => run('preview', s, true), false, !s.still]] : [])]);
   fill(el.querySelector('.s-final'), s, 'final', s.final && `<video src="${media(s, s.final.file)}" controls loop playsinline preload="metadata"></video>`,
     s.final ? (st.final_outdated ? 'older preview' : `${s.final.took}s`) : '',
     [['redo', s.final ? 'Again' : 'Render', () => run('final', s), false, !(s.review === 'approved' && s.preview && !st.preview_outdated)]]);

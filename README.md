@@ -43,10 +43,18 @@ Only the Python standard library, one process, projects as JSON files.
    models folder, each with a strength. A new one starts at a suggested strength: the Studio
    measures how hard each LoRA changes the model's weights (they differ by 30× and more), and
    scales the strong ones down so they don't smear the picture. A row set well above it offers
-   the suggestion, and a warning shows when the LoRAs together push too hard.
+   the suggestion, and a warning shows when the LoRAs together push too hard. **Image model**
+   swaps Krea 2 Turbo for another distilled Krea 2 model from `diffusion_models` (a finetune),
+   rendered with the same settings, for the stills, character photos and places.
 3. **Previews**: MiniMax H3 animates the still at ~0.3 MP (736×416 for 16:9), with sound.
    **Video LoRAs** adds H3 LoRAs. The Studio tells them from Krea 2 ones by their headers.
+   A shot marked **continues** has no cut before it: the shot before ends exactly on its still
+   (H3's first-and-last-frame mode, FL2VA, with MiniMax's matching first line), so the two
+   clips join seamlessly. Leave it off for a cut: a new camera angle or scene. A new still for
+   the continuing shot makes the one before outdated.
 4. **Review**: approve, retry (a new seed) or reject each preview; only approved ones go on.
+   **Same seed** renders a still or preview again with its seed, to see what a changed prompt
+   or LoRA strength does on its own.
 5. **Finals**: the approved preview again (same seed, frame, prompt and LoRAs, so the same
    motion), its latent upscaled by a learned H3 upscaler and refined at H3's full size
    (1344×768).
