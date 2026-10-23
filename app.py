@@ -29,6 +29,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from math import prod
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import apilog
@@ -1074,9 +1075,91 @@ def lora_arch(meta, head):
     return None
 
 
+# How hard a LoRA pushes the model: the mean size (Frobenius norm) of the weight change it adds
+# to a layer, from a few of its layers. LoRAs differ in this by 30x and more, and a strong one at
+# 1.0 (or two stacked) smears the picture into a blurry, faceted mess. The suggested strength
+# brings each down to LORA_TARGET (about where well-behaved ones sit at 1.0), never above
+# LORA_MAX (stills stay at 0.8 at most, so a style doesn't drown the identity LoRA).
+LORA_TARGET = {"krea": 10.0, "h3": 10.0}
+LORA_MAX = {"krea": 0.8, "h3": 1.0}
+LORA_BUDGET = 8_000_000   # multiplications per file for plain LoRAs: ~1 s on the box
+LORA_LAYERS = 16
+
+
+def lora_push(fh, base, head):
+    """Estimate the mean |weight change| over LORA_LAYERS of a LoRA's layers, or None for a
+    format it doesn't know. Plain LoRA (down/up or A/B): |alpha/rank * B@A|, from |B@A|^2 =
+    tr((A A^T)(B^T B)) with sampled columns of A and rows of B, the sample smaller the higher the
+    rank. LoKr with full factors: |w1 (x) w2| = |w1| * |w2|, w2 from a sample."""
+    rng = random.Random(0)
+    fmt = {"F32": ("<f", 4), "F16": ("<e", 2), "BF16": ("<f", 2)}
+
+    def values(info, idx):
+        """The tensor's elements at the flat indices idx, as floats."""
+        f, size = fmt[info["dtype"]]
+        a, b = info["data_offsets"]
+        fh.seek(base + a)
+        raw = fh.read(b - a)
+        if info["dtype"] == "BF16":   # the top half of a float32
+            return [struct.unpack(f, b"\0\0" + raw[i * 2:i * 2 + 2])[0] for i in idx]
+        return [struct.unpack_from(f, raw, i * size)[0] for i in idx]
+
+    def gram(rows):
+        """r lists -> the r x r matrix of their dot products."""
+        g = [[0.0] * len(rows) for _ in rows]
+        for p in range(len(rows)):
+            for q in range(p, len(rows)):
+                g[p][q] = g[q][p] = sum(map(float.__mul__, rows[p], rows[q]))
+        return g
+
+    def pick(layers):
+        return [layers[i * len(layers) // LORA_LAYERS] for i in range(min(LORA_LAYERS, len(layers)))]
+
+    norms = []
+    downs = sorted(k for k in head if k.endswith((".lora_down.weight", ".lora_A.weight")))
+    lokr = sorted(k for k in head if k.endswith(".lokr_w1"))
+    if downs:
+        for d in pick(downs):
+            u = d.replace("lora_down", "lora_up").replace("lora_A", "lora_B")
+            stem = d.rsplit(".lora_", 1)[0]
+            if u not in head or len(head[d]["shape"]) != 2 or len(head[u]["shape"]) != 2:
+                return None
+            (rank, n_in), (n_out, rank_b) = head[d]["shape"], head[u]["shape"]
+            if rank != rank_b:
+                return None
+            alpha = values(head[stem + ".alpha"], [0])[0] if stem + ".alpha" in head else rank
+            sample = max(64, min(512, 2 * LORA_BUDGET // (LORA_LAYERS * rank * rank)))
+            cols = sorted(rng.sample(range(n_in), min(sample, n_in)))
+            rows = sorted(rng.sample(range(n_out), min(sample, n_out)))
+            a = values(head[d], [r * n_in + c for r in range(rank) for c in cols])
+            b = values(head[u], [r * rank + k for k in range(rank) for r in rows])
+            ga = gram([a[r * len(cols):(r + 1) * len(cols)] for r in range(rank)])
+            gb = gram([b[k * len(rows):(k + 1) * len(rows)] for k in range(rank)])
+            sq = sum(ga[p][q] * gb[q][p] for p in range(rank) for q in range(rank))
+            norms.append((max(sq, 0.0) * n_in / len(cols) * n_out / len(rows)) ** 0.5 * alpha / rank)
+    elif lokr:
+        for w1 in pick(lokr):
+            w2 = w1[:-1] + "2"
+            if w2 not in head:     # a decomposed factor (w2_a/w2_b): not measured
+                return None
+            n1, n2 = (prod(head[k]["shape"]) for k in (w1, w2))
+            s2 = rng.sample(range(n2), min(4096, n2))
+            sq1 = sum(x * x for x in values(head[w1], range(n1)))
+            sq2 = sum(x * x for x in values(head[w2], s2)) * n2 / len(s2)
+            norms.append((sq1 * sq2) ** 0.5)
+    return sum(norms) / len(norms) if norms else None
+
+
+def suggested_strength(push, arch):
+    if not push:
+        return None
+    return max(0.05, round(min(LORA_MAX.get(arch, 1.0), LORA_TARGET.get(arch, 10.0) / push) * 20) / 20)
+
+
 def installed_loras(arch="krea"):
     """The LoRAs for one model in SwarmUI's Models/Lora (not the Studio's own), from their
-    safetensors headers: [{"file", "title", "trigger"}]. arch: "krea" (stills) or "h3" (video)."""
+    safetensors headers: [{"file", "title", "trigger", "push", "suggested"}] (see lora_push).
+    arch: "krea" (stills) or "h3" (video). Measured once per file (~0-3 s), then cached."""
     root = model_dir("Lora")
     out = []
     for folder, _, files in os.walk(root):
@@ -1093,10 +1176,16 @@ def installed_loras(arch="krea"):
                     with open(path, "rb") as fh:
                         n = struct.unpack("<Q", fh.read(8))[0]
                         head = json.loads(fh.read(min(n, 64 * 1024 * 1024)))
-                    meta = head.get("__metadata__") or {}
+                        meta = head.pop("__metadata__", None) or {}
+                        kind = lora_arch(meta, head)
+                        try:
+                            push = lora_push(fh, 8 + n, head) if kind else None
+                        except (KeyError, ValueError, TypeError, struct.error):
+                            push = None
                     lora_info[path] = (mtime, {"file": rel, "title": meta.get("modelspec.title") or os.path.splitext(f)[0],
                                                "trigger": str(meta.get("modelspec.trigger_phrase") or "").strip(),
-                                               "arch": lora_arch(meta, head)})
+                                               "arch": kind, "push": push and round(push, 1),
+                                               "suggested": suggested_strength(push, kind)})
             except (OSError, ValueError, struct.error):
                 continue
             if lora_info[path][1]["arch"] == arch:
@@ -1220,7 +1309,8 @@ class Handler(BaseHTTPRequestHandler):
                     "queue": queue, "history": history, "missing": missing_models(),
                     "llm": LLM_MODEL, "sizes": wf.SIZES, "switcher": bool(SWITCHER), "now": time.time()})
         if parts == ["api", "loras"]:
-            return self.json({"loras": installed_loras("krea"), "video_loras": installed_loras("h3")})
+            return self.json({"loras": installed_loras("krea"), "video_loras": installed_loras("h3"),
+                              "targets": {"loras": LORA_TARGET["krea"], "video_loras": LORA_TARGET["h3"]}})
         if parts == ["api", "models"]:
             try:
                 return self.json({"models": llm_models(), "default": LLM_MODEL})

@@ -40,7 +40,10 @@ Only the Python standard library, one process, projects as JSON files.
    [Krea 2 Identity Edit V2](https://huggingface.co/conradlocke/krea2-identity-edit) LoRA with
    their photos, one pass per person. Krea doesn't know names, so the Studio swaps them for
    positions ("the person on the left"). **LoRAs** under the brief adds Krea 2 LoRAs from the
-   models folder, each with a strength.
+   models folder, each with a strength. A new one starts at a suggested strength: the Studio
+   measures how hard each LoRA changes the model's weights (they differ by 30× and more), and
+   scales the strong ones down so they don't smear the picture. A row set well above it offers
+   the suggestion, and a warning shows when the LoRAs together push too hard.
 3. **Previews**: MiniMax H3 animates the still at ~0.3 MP (736×416 for 16:9), with sound.
    **Video LoRAs** adds H3 LoRAs. The Studio tells them from Krea 2 ones by their headers.
 4. **Review**: approve, retry (a new seed) or reject each preview; only approved ones go on.
