@@ -199,6 +199,9 @@ const ICON = {
 };
 const icon = n => `<svg class="ic" viewBox="0 0 24 24">${ICON[n]}</svg>`;
 let STATE = {}, P = null, mode = 'shots', OFFSET = 0;
+// Counts the changes sent (at their start and their end): a poll that overlapped one may carry
+// the project from before it, and drawing that would undo the change on screen until the next poll.
+let EDITS = 0;
 const KIND = {shots: 'Writing the shot list', looks: 'Character photos and places', still: 'Still', preview: 'Preview', final: 'Final', upscale: 'Upscale'};
 // The local AI page is one port down from the Studio (or ai.<domain> with Pi-hole names).
 $('local-ai').href = location.port ? `${location.protocol}//${location.hostname}:8005/`
@@ -208,7 +211,10 @@ async function api(method, path, body, raw) {
   const opts = {method, headers: {}};
   if (raw) { opts.body = raw; opts.headers['Content-Type'] = raw.type || 'application/octet-stream'; }
   else if (body !== undefined) { opts.body = JSON.stringify(body); opts.headers['Content-Type'] = 'application/json'; }
-  const r = await fetch(path, opts);
+  const edit = method !== 'GET';
+  if (edit) EDITS++;
+  let r;
+  try { r = await fetch(path, opts); } finally { if (edit) EDITS++; }
   if (r.status === 401) { location.href = '/_ai/login?next=' + encodeURIComponent(location.pathname + location.hash); throw new Error('login'); }
   const d = r.headers.get('content-type')?.includes('json') ? await r.json() : await r.text();
   if (!r.ok) { showError((d && d.error) || d || r.statusText); throw new Error('api'); }
@@ -237,8 +243,10 @@ async function poll() {
   $('missing').textContent = miss.length ? `Models missing in the models folder (see the Studio's README): ${miss.join(', ')}` : '';
   tick();
   if (P) {
-    try { P = await api('GET', '/api/projects/' + P.id); } catch (e) { return; }
-    renderProject(false);
+    const edits = EDITS, id = P.id;
+    let d; try { d = await api('GET', '/api/projects/' + id); } catch (e) { return; }
+    if (edits !== EDITS || !P || P.id !== id) return;
+    P = d; renderProject(false);
   } else renderHome();
 }
 function tick() {
@@ -402,8 +410,12 @@ async function sendPicture(file) {
 function renderLooks() {
   const box = $('looks');
   const key = JSON.stringify([P.places, P.outfits, P.characters.map(c => [c.id, c.name, !!c.box]), P.aspect]);
-  if (box._key === key || box.contains(document.activeElement)) return;
+  // Not while you type in one of its fields; a clicked button keeps the focus too, but doesn't count.
+  const typing = box.contains(document.activeElement) && document.activeElement.matches('input, textarea, select');
+  if (box._key === key || typing) return;
   box._key = key;
+  // What waited for you to leave a field is drawn as you leave it, not on the next poll.
+  box.onfocusout = () => setTimeout(() => P && renderLooks());
   const charOpts = cur => P.characters.map(c => `<option value="${c.id}" ${c.id === cur ? 'selected' : ''}>${esc(c.name)}</option>`).join('');
   const missing = P.characters.some(c => c.box) || P.places.some(x => !x.image && x.look.trim());
   box.innerHTML = `<div class="row" style="margin-bottom:6px"><button class="small" id="make-looks" ${missing ? '' : 'disabled'}

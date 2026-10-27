@@ -15,12 +15,14 @@ import base64
 import glob
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import random
 import re
 import secrets
 import shutil
+import socket
 import struct
 import threading
 import time
@@ -459,29 +461,83 @@ def llm(system, user, model, images=()):
         body = {"model": model, "max_tokens": 30000, "temperature": 0.7,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 "reasoning_effort": "medium", "chat_template_kwargs": {"reasoning_effort": "medium"}}
+    if found["via"] == "openai":
+        url, headers = LLM_URL + path, {"Content-Type": "application/json", **({"Authorization": "Bearer " + LLM_KEY} if LLM_KEY else {})}
+    else:
+        url, headers = SWITCHER + path, {"Authorization": "Bearer " + API_KEY, "Content-Type": "application/json"}
     t = time.time()
-    try:
-        if found["via"] == "openai":
-            answer = llm_call("POST", path, body, timeout=3 * 3600)
-        else:
-            req = urllib.request.Request(SWITCHER + path, data=json.dumps(body).encode(), method="POST",
-                                         headers={"Authorization": "Bearer " + API_KEY, "Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=3 * 3600) as r:
-                answer = json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        error = e.read()[:2000].decode(errors="replace")
-        apilog.write("llm", path=path, request=apilog.without_images(body), status=e.code, error=error,
-                     seconds=round(time.time() - t, 1))
-        raise RuntimeError(f"{model}: HTTP {e.code} {error[:300]}") from None
-    except OSError as e:
-        apilog.write("llm", path=path, request=apilog.without_images(body), error=str(e),
-                     seconds=round(time.time() - t, 1))
-        raise
-    apilog.write("llm", path=path, request=apilog.without_images(body), response=answer,
-                 seconds=round(time.time() - t, 1))
+    status, answer, error = chat_stream(url, headers, body, found["via"] == "ollama")
+    apilog.write("llm", path=path, request=apilog.without_images(body), status=status,
+                 **({"error": error} if error else {"response": answer}), seconds=round(time.time() - t, 1))
+    if error == "stopped":
+        raise RuntimeError("stopped")
+    if error:
+        raise RuntimeError(f"{model}: " + (f"HTTP {status} " if status and status >= 400 else "") + error[:300])
     if found["via"] == "ollama":
-        return (answer.get("message") or {}).get("content") or ""
-    return answer["choices"][0]["message"].get("content") or ""
+        return answer["message"]["content"]
+    return answer["choices"][0]["message"]["content"]
+
+
+def chat_stream(url, headers, body, ollama):
+    """Sends a chat request as a stream and puts the answer together as the API would have sent
+    it whole. Stop cuts it short: the closed connection ends the generation (the switcher passes
+    that on to the model server, which a request waiting for a whole answer never would).
+    Returns (HTTP status, answer, error)."""
+    u = urllib.parse.urlsplit(url)
+    conn = (http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection)(u.netloc, timeout=3 * 3600)
+    body = {**body, "stream": True, **({} if ollama else {"stream_options": {"include_usage": True}})}
+    out = {"status": None, "error": None, "text": [], "last": {}, "sock": None}
+
+    def read():
+        try:
+            conn.connect()
+            out["sock"] = conn.sock  # conn lets go of it once an answer says "Connection: close"
+            conn.request("POST", u.path, json.dumps(body).encode(), headers)
+            with conn.getresponse() as r:
+                out["status"] = r.status
+                if r.status >= 400:
+                    out["error"] = r.read()[:2000].decode(errors="replace")
+                    return
+                for line in r:
+                    line = line.strip()
+                    if not ollama:  # server-sent events: "data: {...}", then "data: [DONE]"
+                        if not line.startswith(b"data:"):
+                            continue
+                        line = line[5:].strip()
+                        if line == b"[DONE]":
+                            break
+                    if not line:
+                        continue
+                    d = json.loads(line)
+                    if d.get("error"):
+                        out["error"] = str(d["error"])[:2000]
+                        return
+                    out["last"] = d
+                    parts = [d.get("message") or {}] if ollama else [c.get("delta") or {} for c in d.get("choices") or []]
+                    out["text"] += [x.get("content") or "" for x in parts]
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            out["error"] = out["error"] or str(e) or type(e).__name__
+        finally:
+            conn.close()
+            if out["sock"]:
+                out["sock"].close()
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    while reader.is_alive():
+        reader.join(1)
+        if current["stop"] and reader.is_alive():
+            try:
+                out["sock"] and out["sock"].shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            return out["status"], None, "stopped"
+    text = "".join(out["text"])
+    if ollama:  # the last line has the token counts
+        answer = {**out["last"], "message": {"role": "assistant", "content": text}}
+    else:
+        answer = {"choices": [{"message": {"role": "assistant", "content": text}}], "usage": out["last"].get("usage")}
+    return out["status"], answer, out["error"]
 
 
 PICTURE_PROMPT = """You read one picture for an AI film pipeline. It is the first frame of the film's first shot; the rest of the film must match it. Answer with JSON only, no other text:
