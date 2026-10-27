@@ -21,7 +21,8 @@ Only the Python standard library, one process, projects as JSON files.
    Motion prompts follow H3's own format (`integrated_multimodal_description`,
    `overall_soundscape`, `non_diegetic_music`; the Studio adds the first-frame line): the model
    gets MiniMax's [H3 prompt-writing guide](https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills/h3-prompt-writing)
-   with the brief. **Rewrite for H3** turns a prompt you wrote in plain words into that format.
+   with the brief. **Rewrite for H3** turns a prompt you wrote in plain words into that format;
+   shots the model left without motion get the same rewrite on their own.
    Each project picks its chat model under the brief (`STUDIO_LLM` is the default for new
    projects). Small models (8-14B) work but write weaker H3 prompts.
 

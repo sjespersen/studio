@@ -729,7 +729,14 @@ def write_shots(p, replace):
         else:
             p["shots"].extend(out)
         log(p, f"{model} wrote {len(out)} shots")
+        # A model that balks at the motion (or forgets it) leaves those shots without: the
+        # rewrite writes it from the still, one shot at a time, and a refusal shows on the shot.
+        empty = [s["id"] for s in out if not s["motion_prompt"].strip()]
+        if empty:
+            log(p, f"{len(empty)} of them came without motion and sound: writing those one by one")
         save(p)
+    if empty:
+        enqueue(p, "prompt", empty)
     return bool(opening)
 
 
