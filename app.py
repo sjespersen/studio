@@ -257,7 +257,7 @@ def llm_models():
                 for m in sorted(models, key=lambda m: m.get("id", "")) if m.get("id")]
     st = switcher("GET", "/_ai/api/status")
     out = [{"id": s["models"][0], "label": s["title"], "service": s["id"], "via": "switcher"}
-           for s in st.get("services", []) if s.get("models") and not s.get("always_on")]
+           for s in st.get("services", []) if s.get("models") and not s.get("always_on") and s.get("kind", "chat") == "chat"]
     ollama = next((s for s in st.get("services", []) if s.get("always_on")), None)
     if ollama and ollama["state"] == "running":
         try:
